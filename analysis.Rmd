@@ -1,0 +1,168 @@
+---
+title: "Customer Segmentation — RFM Analysis"
+author: "Shubham"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: cosmo
+    highlight: tango
+    number_sections: true
+params:
+  data_file: "data/cleaned_retail.csv"
+  k_opt: 5
+---
+
+# Hide code/warnings/messages by default
+
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+# Libraries
+
+library(readr)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(factoextra)
+library(cluster)
+library(tidyr)
+library(reshape2)
+library(scales)
+library(viridis)
+library(knitr)
+
+data <- read_csv(params$data_file, show_col_types = FALSE)
+data$InvoiceDate <- as_datetime(data$InvoiceDate)
+
+glimpse(data)
+cat("Rows:", nrow(data), "Columns:", ncol(data), "\n")
+
+top_products <- data %>%
+group_by(Description) %>%
+summarise(TotalSales = sum(TotalPrice, na.rm = TRUE)) %>%
+arrange(desc(TotalSales)) %>%
+slice_head(n = 10)
+
+ggplot(top_products, aes(x = reorder(Description, TotalSales), y = TotalSales)) +
+geom_col(fill = "darkorange") +
+coord_flip() +
+labs(title = "Top 10 Selling Products", x = "Product", y = "Total Sales") +
+theme_minimal()
+
+country_sales <- data %>%
+group_by(Country) %>%
+summarise(TotalSales = sum(TotalPrice, na.rm = TRUE)) %>%
+arrange(desc(TotalSales)) %>%
+slice_head(n = 10)
+
+ggplot(country_sales, aes(x = reorder(Country, TotalSales), y = TotalSales)) +
+geom_col(fill = "seagreen") +
+coord_flip() +
+labs(title = "Top 10 Countries by Sales", x = "Country", y = "Total Sales") +
+theme_minimal()
+
+snapshot_date <- max(data$InvoiceDate, na.rm = TRUE) + days(1)
+
+rfm <- data %>%
+group_by(CustomerID) %>%
+summarise(
+Recency = as.numeric(difftime(snapshot_date, max(InvoiceDate), units = "days")),
+Frequency = n_distinct(InvoiceNo),
+Monetary = sum(TotalPrice, na.rm = TRUE),
+.groups = "drop"
+)
+
+summary(rfm)
+
+# log transform monetary
+
+rfm <- rfm %>% mutate(Monetary_log = log1p(Monetary))
+
+# scale features
+
+rfm_scaled <- scale(rfm %>% select(Recency, Frequency, Monetary_log))
+
+set.seed(123)
+p_elbow <- fviz_nbclust(rfm_scaled, kmeans, method = "wss") + ggtitle("Elbow Method (WSS)")
+p_sil <- fviz_nbclust(rfm_scaled, kmeans, method = "silhouette") + ggtitle("Silhouette Method")
+
+print(p_elbow)
+print(p_sil)
+
+k_opt <- params$k_opt
+set.seed(42)
+kmeans_model <- kmeans(rfm_scaled, centers = k_opt, nstart = 100, iter.max = 200)
+rfm$Cluster <- factor(kmeans_model$cluster)
+
+rfm_summary <- rfm %>%
+group_by(Cluster) %>%
+summarise(
+Avg_Recency = round(mean(Recency), 1),
+Avg_Frequency = round(mean(Frequency), 2),
+Avg_Monetary = round(mean(Monetary), 2),
+Count = n(),
+.groups = "drop"
+) %>%
+arrange(as.integer(Cluster))
+
+rfm_summary
+
+# Rank clusters by Avg_Monetary and map to readable names
+
+ranked <- rfm_summary %>% arrange(desc(Avg_Monetary)) %>% mutate(Rank = row_number())
+
+# Default labels; you can edit if you used a different number of clusters
+
+labels <- c("VIP", "Loyal", "Occasional", "At-Risk", "Low-Value")
+labels_use <- labels[1:nrow(ranked)]
+label_map <- setNames(labels_use, ranked$Cluster)
+rfm$Segment <- unname(label_map[as.character(rfm$Cluster)])
+
+rfm_summary_labeled <- rfm %>%
+group_by(Segment) %>%
+summarise(
+Avg_Recency = round(mean(Recency), 1),
+Avg_Frequency = round(mean(Frequency), 2),
+Avg_Monetary = round(mean(Monetary), 2),
+Count = n(),
+.groups = "drop"
+) %>%
+arrange(desc(Avg_Monetary))
+
+rfm_summary_labeled
+
+pca <- prcomp(rfm_scaled, center = TRUE, scale. = TRUE)
+pca_df <- data.frame(PC1 = pca$x[,1], PC2 = pca$x[,2], Segment = rfm$Segment)
+
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Segment)) +
+geom_point(alpha = 0.6, size = 1.8) +
+labs(title = "Customer Segments (PCA Projection)") +
+theme_minimal() +
+scale_color_brewer(palette = "Set2")
+
+centroids <- as.data.frame(kmeans_model$centers)
+centroids$Cluster <- paste0("Cluster_", 1:nrow(centroids))
+cent_m <- pivot_longer(centroids, cols = -Cluster, names_to = "Feature", values_to = "Value")
+
+ggplot(cent_m, aes(x = Feature, y = Cluster, fill = Value)) +
+geom_tile() +
+scale_fill_viridis_c(option = "plasma") +
+labs(title = "Cluster Centroid Heatmap (Scaled Features)", x = "Feature", y = "Cluster") +
+theme_minimal() +
+theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+ggplot(rfm, aes(x = Frequency, y = Monetary, color = Segment)) +
+geom_jitter(alpha = 0.6, size = 1.6) +
+labs(title = "Customer Segments: Frequency vs Monetary",
+x = "Frequency (Distinct Invoices)",
+y = "Monetary (Total Spend)") +
+theme_minimal() +
+scale_color_brewer(palette = "Set2")
+
+knitr::kable(rfm_summary_labeled, caption = "Segment Summary (Labeled)")
+
+dir.create("output", showWarnings = FALSE)
+write_csv(rfm, "output/customer_segments_labeled.csv")
+write_csv(rfm_summary_labeled, "output/rfm_cluster_summary_labeled.csv")
+cat("Saved labeled customers and summaries to 'output/'\n")
